@@ -78,6 +78,10 @@ Default value: `false`
 
 The folder to read the additional configuration files (`*.conf`) from.
 
+### Option: `use_identity_as_username`
+
+If set to `true` and `require_certificate` is `true` then the CN from the client certificate will be used as the username instead of requiring a username and password.
+
 ### Option: `cafile` (optional)
 
 A file containing a root certificate. Place this file in the Home Assistant `ssl` folder.
