@@ -79,6 +79,7 @@ fi
 bashio::var.json \
   cafile "${cafile}" \
   certfile "${certfile}" \
+  use_identity_as_username "^$(bashio::config 'use_identity_as_username')" \
   customize "^$(bashio::config 'customize.active')" \
   customize_folder "$(bashio::config 'customize.folder')" \
   keyfile "${keyfile}" \
