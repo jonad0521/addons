@@ -1,5 +1,9 @@
 # Changelog
 
+## 6.5.0
+
+- Add `use_identity_as_username` option
+
 ## 6.4.1
 
 - Increase default max_queued_messages to 8192 to fix dropped messages during Home Assistant startup
