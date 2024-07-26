@@ -22,6 +22,7 @@ options:
   logins: []
   require_certificate: false
   certfile: fullchain.pem
+  use_identity_as_username: false
   keyfile: privkey.pem
   customize:
     active: false
@@ -40,6 +41,7 @@ schema:
   certfile: str
   cafile: str?
   keyfile: str
+  use_identity_as_username: bool?
   customize:
     active: bool
     folder: str
