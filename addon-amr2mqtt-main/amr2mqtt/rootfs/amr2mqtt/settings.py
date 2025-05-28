@@ -1,75 +1,73 @@
-#Settings file for `amr2mqtt.py` script (v1.5)
-METERS_ARR = []
-# Above should be an array of dictionary entries of form containing configuration data for each meter you want to track.
-# {"id": NNNNN, "msgtype": <message type>, "name": <Desired meter name>, "reading_field": <Name of field with reading>, "multiplier": NNNN, "other_fields": <list of optional other fields to publish>}, retain: <True/False, optional>}
-#
-# where:
-#    id = numerical id number of the meter
-#    msgtype = scm|scm+|idm|netidm|r900|r900bcd (optional, default = scm)
-#    name = user-defined name for the meter (can be a path relative to MQTT_PREFIX) (optional, default = "")
-#    reading_field = name for the meter quantity as appears in the json output from rtlamr (optional, set to defaults per msgtype)
-#    multiplier = factor to multiply the raw numerical output (optional, default = DEFAULT_MULTIPLIER)
-#                 (e.g., use 1000 to convert meter reading from kWh to Wh)
-#    other_fields = optional list of other fields to publish
-#    retain = Whether to retain MQTT messages on the broker (True/False) (optional, default = MQTT_RETAIN_DEFAULT)
-#
-#    NOTE: it can be important to specify the message type, since some meters send out multiple message types for the same meter
-#    NOTE: if you use the defaults, you only need to specify: 'id' and msgtype (and for DEFAULT_MSGTYPE, only the 'id'
-#
-# Examples:
-#	{"id": 60210816},
-#	{"id": 60210816, "name": "MyMeter-SCM"},
-#	{"id": 60210816, "msgtype": 'scm', "name": "MyMeter-SCM", "reading_field": "Consumption", "multiplier": 1},
-#	{"id": 1550158635, "msgtype": 'scm+', "name": "Gas-SCMplus", "reading_field": "Consumption", "multiplier": 1},
-#	{"id": 25808139, "msgtype": 'IDM', "name": "Electric-IDM", "reading_field": "LastConsumptionCount", "multiplier": 1000, "retain": True},
-#   {"id": 1576312494, "msgtype": 'r900', "name": "Water-R900", "reading_field": "Consumption", "multiplier": 0.1, "other_fields": ["Leak", "LeakNow"]},
-
-## MQTT Server settings
-# MQTT_HOST - name or IP address of MQTT broker (string)
-# MQTT_PORT - port to access MQTT broker (int)
-# MQTT_USER - user name (string, optional)
-# MQTT_PASSWORD - password (string, optional)
-#     NOTE: If no authentication, leave MQTT_USER and MQTT_PASSWORD empty
-# MQTT_TOPIC_PREFIX - prefix under which all meters will publish their messages (path-like string)
-# MQTT_RETAIN_DEFAULT - default value on whether to retain MQTT topics (True/False)
+"""Get our settings from os.environ to facilitate running in Docker.
+"""
+import os
+import logging
+import json
+import functools
 
 
-MQTT_HOST = '127.0.0.1'
-MQTT_PORT = 1883
-MQTT_USER = ''
-MQTT_PASSWORD = ''
-MQTT_TOPIC_PREFIX = 'home/meters'
-MQTT_RETAIN_DEFAULT = False
+def make_meters_map(meters, meter):
+    """Add meter to meters by its ID."""
+    meters[str(meter["id"])] = meter
+    del meter["id"]
+    return meters
 
-# Path to rtl_tcp
-RTL_TCP = '/usr/bin/rtl_tcp'
 
-# Path to rtlamr
-RTLAMR = '/usr/local/bin/rtlamr'
+# Pull in watched meters data
+# If not empty, pull out IDs/protocols to watch
+# If empty then we're in discovery mode
+with open("/data/options.json", encoding="utf-8") as config_options:
+    meters_config = json.load(config_options)["meters"]
 
-# Centerfreq for 'rtlamr' (default is 912.6 MHz)
-CENTERFREQ = '912.6M'
+if bool(meters_config):
+    METERS = functools.reduce(make_meters_map, meters_config, {})
+    WATCHED_METERS = ",".join(METERS.keys())
+    WATCHED_PROTOCOLS = ",".join(set([meter["protocol"] for meter in meters_config]))
+else:
+    METERS = {}
+    WATCHED_PROTOCOLS = "all"
 
-PUBLISH_DUPLICATES = False  #Publish new messages that are duplicates of last message to the meter (True/False)
+# Get server, TLS and auth settings
+MQTT_HOST = os.environ.get("MQTT_HOST")
+MQTT_PORT = int(os.environ.get("MQTT_PORT"))
+MQTT_CA_CERT = os.environ.get("MQTT_CA")
+MQTT_CERTFILE = os.environ.get("MQTT_CERT")
+MQTT_KEYFILE = os.environ.get("MQTT_KEY")
+MQTT_USERNAME = os.environ.get("MQTT_USERNAME")
+MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD")
+MQTT_CLIENT_ID = os.environ.get("MQTT_CLIENT_ID")
 
-OUTLIER_PERCENT = 15 #Minimum percent change between readings to be considered a faulty reading (set to '' or False to ignore)
-OUTLIER_ABSOLUTE = 250 #Minimum absolute change (after multiplier correction) between readings to be considered a faulty reading (set to '' or False to ignore)
+# Get discovery info
+VIA_DEVICE = os.environ.get("BUILD_NAME")
+SW_VERSION = os.environ.get("BUILD_VERSION")
+HA_DISCOVERY_DISABLED = bool(os.environ.get("HA_DISCOVERY_DISABLED"))
+discovery_topic = os.environ.get("HA_DISCOVERY_TOPIC")
+HA_DISCOVERY_TOPIC = discovery_topic if bool(discovery_topic) else "homeassistant"
 
-DEFAULT_MSGTYPE = 'scm' #Default message type if not specified (can be overriden per meter)
-DEFAULT_MULTIPLIER = 1 #Default multiplier for readings (can be overriden per meter)
+# Set the MQTT base topic
+base_topic = os.environ.get("MQTT_BASE_TOPIC")
+MQTT_BASE_TOPIC = base_topic if bool(base_topic) else "amr2mqtt"
+MQTT_AVAILABILTY_TOPIC = f"{MQTT_BASE_TOPIC}/bridge/state"
 
-#Dictionary of default 'id' and 'reading_field' for each message type [This should in general not need to be changed
-MSGTYPE_DICT = { #Defaults for various message types
-    'scm': {"id": 'ID', "reading_field": "Consumption"},
-    'scm+': {"id": 'EndpointID', "reading_field": "Consumption"},
-    'idm': {"id": 'ERTSerialNumber', "reading_field": "LastConsumptionCount"},
-    'netidm': {"id": 'ERTSerialNumber', "reading_field": "LastConsumptionCount"},
-    'r900': {"id": 'ID', "reading_field": "Consumption"},
-    'r900bcd': {"id": 'ID', "reading_field": "Consumption"},
+# Using last seen
+LAST_SEEN_FORMAT = os.environ.get("LAST_SEEN")
+LAST_SEEN_ENABLED = LAST_SEEN_FORMAT != "disable"
+
+# RTLAMR options
+symbol_length = os.environ.get("SYMBOL_LENGTH")
+SYMBOL_LENGTH = int(symbol_length) if bool(symbol_length) else 72
+
+# Set up logging
+EV_TO_LOG_LEVEL = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
 }
+log_level = EV_TO_LOG_LEVEL.get(os.environ.get("LOG_LEVEL"))
+logging.basicConfig()
+logging.getLogger().setLevel(log_level)
 
-#===============================================================================
-# Local Variables:
-# mode: Python;
-# tab-width: 2
-# End:
+# path to rtlamr
+RTLAMR = "/usr/bin/rtlamr"
