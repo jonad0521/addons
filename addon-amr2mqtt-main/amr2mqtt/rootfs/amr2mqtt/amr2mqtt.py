@@ -1,239 +1,520 @@
 #!/usr/bin/env python3
-#===============================================================================
-'''
-Runs rtlamr to watch for AMR broadcasts from power meter. If meter id
-is on the list, usage is sent to 'PREFIX/{meter id}' topic on the MQTT broker specified in settings.
+"""
+Runs rtlamr to watch for broadcasts from power meter(s). Passings readings
+found to MQTT at topic `amr2mqtt/{meter_ID}`. If meter ID
+is a watched one, processes its reading using settings first.
 
-METERS_ARR = A Python list of dictionary entries for each meter to monitor where each entery is of form:
-    {"msgtype": <message type> "id": <meter id>, "name": "<meter name>", "reading_field": <name of field to read>, "multiplier": <float>, "other_fields": [<list>], "retain": true|false}}
-
-MQTT_HOST - name or IP address of MQTT broker (string)
-MQTT_PORT - port to access MQTT broker (int)
-MQTT_USER - user name (string, optional)
-MQTT_PASSWORD - password (string, optional)
-MQTT_TOPIC_PREFIX - prefix under which all meters will publish their messages (path-like string)
-MQTT_RETAIN_DEFAULT - default value on whether to retain MQTT topics (true/false)
-   NOTE: If no authentication, leave MQTT_USER and MQTT_PASSWORD empty
-
-RTL_TCP = Path to 'rtl_tcp' executable
-RTL_AMR = Path to 'rtlamr' executable
-
-CENTERFREQ = Center frequency for rtl_tcp (default is 912.6 MHz)(string)
-
-PUBLISH_DUPLICATES - Publish new messages that are duplicates of last message to the meter (True/False)
-
-OUTLIER_PERCENT - Minimum percent change between readings to be considered a faulty reading (set to '' or False to ignore)
-OUTLIER_ABSOLUTE - Minimum absolute change (after multiplier correction) between readings to be considered a faulty reading (set to '' or False to ignore)
-
-DEFAULT_MSGTYPE - Default message type if not specified (can be overriden per meter)
-DEFAULT_MULTIPLIER - Default multiplier for readings (can be overriden per meter)
-
-Note: All meter, mqtt, and other variables are set in the companion file `settings.py
-
-***NOTE*** Based on original version by: Ben Johnson: https://github.com/ragingcomputer/amridm2mqtt
-KEY ADDITIONS include ability to:
-    - Mix and match all the  message types supported by 'rtlamr' from multiple meters
-    - Specify MQTT_TOPIC_PREFIX
-    - Specify or use default field for reading or any given meter and message type
-    - Specify user-friendly name for the meter topic (in addition to the number)
-    - Specify multiplier on a per meter basis (and to set a default)
-    - Specify percentage and absolute deviations to identify and reject outliers
-    - Specify whether to publish unchanged (i.e., duplicate messages)
-    - Publish additional fields beyond just the core 'consumption' reading
-    - Specify whether to 'retain' messages by meter (and to set a default)
-    - Specify 'rtlamr' center frequency
-    - Set debug level for more debug details and granularity
-
-Ver 1.5 (August 2024)
-Jeffrey J. Kosowsky
-'''
-#===============================================================================
-import os
+"""
+from datetime import timedelta, datetime, timezone
+import logging
 import subprocess
 import signal
 import sys
 import time
 import json
-import paho.mqtt.publish as publish
-
+import re
+import math
+import paho.mqtt.client as mqtt
 import settings
-#===============================================================================
-rtltcp = None
-rtlamr = None
+from dateutil import parser
 
-DEBUG = os.environ.get('DEBUG', '')
-if not DEBUG:
-    DEBUG = 0
-elif  DEBUG not in ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']:
-    DEBUG = 1
-DEBUG = int(DEBUG)
+CATEGORY_DIAGNOSTIC = "diagnostic"
+LAST_INTERVAL_ATTR = "LastIntervalConsumption"
+CONSUMPTION_FIELD = "Consumption"
+ID_FIELD = "ID"
+INTERVAL_FIELD = "DifferentialConsumptionIntervals"
+INTERVAL_ID_FIELD = "ConsumptionIntervalCount"
+INTERVAL_START_FIELD = "IntervalStart"
+IDM_TIME_OFFSET_FIELD = "TransmitTimeOffset"
+IDM_ID_FIELD = "ERTSerialNumber"
+IDM_CONSUMPTION_FIELD = "LastConsumptionCount"
+NETIDM_CONSUMPTION_FIELD = "LastConsumptionNet"
+SCMPLUS_ID_FIELD = "EndpointID"
+LAST_SEEN_ATTR = "last_seen"
+PROTOCOL_ATTR = "Protocol"
+ALL_IDM = [
+    "Preamble",
+    "PacketLength",
+    "HammingCode",
+    "ApplicationVersion",
+    "ERTType",
+    INTERVAL_ID_FIELD,
+    IDM_TIME_OFFSET_FIELD,
+    "SerialNumberCRC",
+    "PacketCRC",
+]
+ATTRIBUTES = {
+    "idm": [
+        "ModuleProgrammingState",
+        "TamperCounters",
+        "AsynchronousCounters",
+        "PowerOutageFlags",
+    ]
+    + ALL_IDM,
+    "netidm": [
+        "ProgrammingState",
+        "LastGeneration",
+        "LastConsumption",
+    ]
+    + ALL_IDM,
+    "r900": [
+        "Unkn1",
+        "NoUse",
+        "BackFlow",
+        "Unkn3",
+        "Leak",
+        "LeakNow",
+        "checksum",
+    ],
+    "scm": [
+        "Type",
+        "TamperPhy",
+        "TamperEnc",
+        "ChecksumVal",
+    ],
+    "scm+": [
+        "FrameSync",
+        "ProtocolID",
+        "EndpointType",
+        "Tamper",
+        "PacketCRC",
+    ],
+}
 
-#===============================================================================
 
-def main():
-    signal.signal(signal.SIGTERM, shutdown)
-    signal.signal(signal.SIGINT, shutdown)
+def shutdown(*args, **kwargs):  # pylint: disable=unused-argument
+    """Disconnect MQTT client, stop rtlamr and exit."""
+    mqttc.publish(
+        topic=settings.MQTT_AVAILABILTY_TOPIC,
+        payload="offline",
+        retain=True,
+    )
+    logging.info("Disconnecting from MQTT broker")
+    mqttc.loop_stop()
+    mqttc.disconnect()
+    stop_rtlamr()
+    sys.exit(0)
 
-    #Convert array of Meters to dictionary, indexed by meter id
-    METERS_DICT = {}
-    for meter in settings.METERS_ARR:
-        msgtype = meter.get('msgtype', settings.DEFAULT_MSGTYPE).lower()
-        METERS_DICT[meter['id']] = {
-            'msgtype': msgtype,
-            'name': meter.get('name', ''),
-            'reading_field': meter.get('reading_field', settings.MSGTYPE_DICT[msgtype]["reading_field"]),
-            'multiplier': meter.get('multiplier', settings.DEFAULT_MULTIPLIER),
-            'other_fields': meter.get('other_fields', []),
-            "retain": meter.get('retain', settings.MQTT_RETAIN_DEFAULT)
-        }
 
-    if not METERS_DICT:
-        print("No meters specified properly... Check 'METERS_DICT' in 'settings.py'", file=sys.stderr)
+def stop_rtlamr():
+    """Stop and hard kill opened rtlamr process."""
+    logging.info("Shutting down rtlamr")
+    rtlamr.send_signal(15)
+    time.sleep(1)
+    rtlamr.send_signal(9)
 
-    MSGTYPES = ','.join(set(value['msgtype'] for value in METERS_DICT.values() if 'msgtype' in value)) #Set assures unique
-    ID_FIELDS = list(set(value['id'] for value in settings.MSGTYPE_DICT.values())) #List of fields where id numbers can be found
 
-    if settings.MQTT_USER and settings.MQTT_PASSWORD:
-        auth = {'username':settings.MQTT_USER, 'password':settings.MQTT_PASSWORD}
+def start_rtlamr():
+    """Start rtlamr program."""
+    rtlamr_cmd = [
+        settings.RTLAMR,
+        f"-msgtype={settings.WATCHED_PROTOCOLS}",
+        "-format=json",
+        f"-symbollength={settings.SYMBOL_LENGTH}",
+    ]
+
+    # Add ID filter if we have a list of IDs to watch
+    if settings.WATCHED_PROTOCOLS != "all":
+        rtlamr_cmd += [f"-filterid={settings.WATCHED_METERS}"]
+
+    logging.info("Starting rtlamr")
+    return subprocess.Popen(
+        rtlamr_cmd,
+        stdout=subprocess.PIPE,
+        universal_newlines=True,
+    )
+
+
+def on_mqtt_connect(client, userdata, flags, result):  # pylint: disable=unused-argument
+    """Send online message on connect."""
+    if result == 0:
+        client.publish(
+            topic=settings.MQTT_AVAILABILTY_TOPIC,
+            payload="online",
+            retain=True,
+        )
     else:
-        auth = None        
+        error_log = "MQTT Broker refused connection - %s (result code %s)"
+        if result == 1:
+            logging.error(error_log, "Incorrect protocol version", result)
+        elif result == 2:
+            logging.error(error_log, "Invalid client identifier", result)
+        elif result == 3:
+            logging.error(error_log, "Server unavailable", result)
+        elif result == 4:
+            logging.error(error_log, "Bad username or password", result)
+        elif result == 5:
+            logging.error(error_log, "Not authorised", result)
+        else:
+            logging.error(error_log, "Unknown error", result)
 
-    #Start the rtl_tcp program
-    global rtltcp
-    rtltcp = subprocess.Popen([settings.RTL_TCP + " > /dev/null 2>&1 &"], shell=True,
-                              stdin=None, stdout=None, stderr=None, close_fds=True)
-    time.sleep(5)
-    print(f'PID: {rtltcp.pid}')
-
-    # start the rtlamr program.
-    rtlamr_cmd = [settings.RTLAMR, f'-centerfreq={settings.CENTERFREQ}', f'-msgtype={MSGTYPES}', '-format=json']
-    global rtlamr
-    rtlamr = subprocess.Popen(rtlamr_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True) #Combnie stderr with stdout
-
-    if settings.OUTLIER_PERCENT:
-        OUTLIER_PMAX = 1 + settings.OUTLIER_PERCENT/100
-        OUTLIER_PMIN = 1 - settings.OUTLIER_PERCENT/100
-    else:
-        OUTLIER_PMAX = ''
-
-    OUTLIER_ABS = settings.OUTLIER_ABSOLUTE
-
-    while True: #Loop through reading AMR messages sequentially
-        try:
-            amr_line = rtlamr.stdout.readline().strip()
-
-            if amr_line.endswith("Error reading samples:  EOF"):
-                print(f'Error: {amr_line}', file=sys.stderr)
-                shutdown(None, None)
-
-            if amr_line[0] != '{': #Not a JSON string
-                continue
-
-            debug_print(4, amr_line)
-
-            amr_json = json.loads(amr_line)
-            timestamp = amr_json["Time"] #Not used currently except for debug
-            message = amr_json["Message"]
-            meter_id, id_field = get_id(message, ID_FIELDS)
-
-            if meter_id not in METERS_DICT: #Not watching this meter
-                continue
-
-            meter_msgtype = METERS_DICT[meter_id]['msgtype']
-            meter_id_field = settings.MSGTYPE_DICT[meter_msgtype]['id']
-            if meter_id_field != id_field: #Message type mismatch between message and message type specified in settings.py
-                #NOTE: Some meters might send out 2 different message types for the same meter (e.g., 'scm' & 'idm') so we will only return the specified one
-                debug_print(2, f'MISMATCH: {meter_id} [meter_id_field|{id_field}] {amr_line}')
-                continue
-
-            reading_field = METERS_DICT[meter_id].get('reading_field', '')
-            reading = message[reading_field];
-            multiplier = METERS_DICT[meter_id]['multiplier']
-            if multiplier != 1:
-                reading *= multiplier
-            other_fields = [
-                f'"{key}": "{message[key]}"' if not isinstance(message[key], (int, float)) else f'"{key}": {message[key]}' #Quote if non-number
-                for key in METERS_DICT[meter_id]['other_fields'] if key in message #Only include if key present in message
-            ]
-
-            debug_print(3, f'meter_id={meter_id}\treading={reading}\tother_fields={other_fields}')
-
-            reading_old = METERS_DICT[meter_id].get('reading_old', '')
-            other_fields_old = METERS_DICT[meter_id].get('other_fields_old', [])
-            if reading == reading_old and other_fields == other_fields_old:
-                continue #Don't rebroadcast old readings
-
-            if reading_old: #Compare to previous reading to see if this is a spurious, out-of-bounds message
-                if (OUTLIER_PMAX and (reading > OUTLIER_PMAX * reading_old or reading < OUTLIER_PMIN * reading_old)) \
-                   or (OUTLIER_ABS and abs(reading - reading_old) > OUTLIER_ABS): #Out of percentage or absolute bounds
-                    print(f'Seemingly erroneous reading: meter={meter_id} current:{reading}\tprevious:{reading_old}')
-                    continue #Don't record erroneous large positive or negative changes
-
-            METERS_DICT[meter_id]['reading_old'] = reading
-            METERS_DICT[meter_id]['other_fields_old'] = other_fields
-
-            meter_name = METERS_DICT[meter_id]['name']
-            if meter_name:
-                meter_name += '-'
-            mqtt_topic = f'{settings.MQTT_TOPIC_PREFIX}/{meter_name}{str(meter_id)}'
-
-            fields_list = [f'"{reading_field}":{reading}'] + other_fields
-            mqtt_payload = '{' + ','.join(fields_list) + '}'
-
-            retain = METERS_DICT[meter_id]['retain']
-
-            send_mqtt(auth, mqtt_topic, mqtt_payload, retain)
-            debug_print(1, f'[{timestamp}] {mqtt_topic}\t{mqtt_payload} [retain={retain}]')
-
-        except Exception as e:
-            debug_print(1, 'Exception squashed! [{}] {}: {}', amr_line, e.__class__.__name__, e)
-            time.sleep(1)
-
-#===============================================================================
-#FUNCTIONS
-
-#Get id from message trying the fields in ID_FIELDS
-def get_id(message, ID_FIELDS):
-    for key in ID_FIELDS:
-        if key in message:
-            return message[key], key
-    raise KeyError(f'None of the keys {ID_FIELDS} found in the message')
-
-#Send data to MQTT broker defined in settings
-def send_mqtt(auth, topic, payload, retain):
-    try:
-        publish.single(topic, payload=payload, qos=1, hostname=settings.MQTT_HOST, port=settings.MQTT_PORT, auth=auth, retain=retain)
-	#NOTE: Don't retain MQTT messages because may be out of date
-    except Exception as ex:
-        print("MQTT Publish Failed: " + str(ex), file=sys.stderr)
-
-#Uses signal to shutdown and hard kill opened processes and self
-def shutdown(signum, frame):
-    global rtlamr, rtltcp
-    try:
-        os.killpg(os.getpgid(rtltcp.pid), signal.SIGTERM) #Note rtl_tcp uses a wrapper which generates another shell... so terminate the whole group
-        rtlamr.send_signal(signal.SIGTERM)
-        time.sleep(1)
-        os.killpg(os.getpgid(rtltcp.pid), signal.SIGKILL) #Note rtl_tcp uses a wrapper which generates another shell... so kill the whole group
-        rtlamr.send_signal(signal.SIGKILL)
-    except Exception as e:
-        print(f"Exception in shutdown: {e}", file=sys.stderr)
-    finally:
+        stop_rtlamr()
         sys.exit(0)
 
-#Debug print
-def debug_print(level, message, *args, **kwargs):
-    if DEBUG >= level:
-        if isinstance(message, str) and args:
-            # Format the message if args are provided
-            message = message.format(*args)
-        print(message, **kwargs, file=sys.stderr)
 
-#===============================================================================
-if __name__ == "__main__":
-    main()
+def create_mqtt_client():
+    """Create MQTT client with TLS and auth if necessary."""
+    client = mqtt.Client(client_id=settings.MQTT_CLIENT_ID)
+    client.on_connect = on_mqtt_connect
+    client.will_set(
+        topic=settings.MQTT_AVAILABILTY_TOPIC,
+        payload="offline",
+        qos=1,
+        retain=True,
+    )
 
-# Local Variables:
-# mode: Python;
-# tab-width: 2
-# End:
+    if settings.MQTT_CA_CERT:
+        client.tls_set(
+            ca_certs=settings.MQTT_CA_CERT,
+            certfile=settings.MQTT_CERTFILE,
+            keyfile=settings.MQTT_KEYFILE,
+        )
+
+    if settings.MQTT_USERNAME:
+        client.username_pw_set(
+            username=settings.MQTT_USERNAME,
+            password=settings.MQTT_PASSWORD,
+        )
+
+    logging.info(
+        "Connecting to MQTT broker at %s:%s", settings.MQTT_HOST, settings.MQTT_PORT
+    )
+    client.connect(
+        host=settings.MQTT_HOST,
+        port=settings.MQTT_PORT,
+        keepalive=60,
+    )
+    return client
+
+
+def create_interval_sensor(meter_id, meter, device_name, device_id):
+    """Create discovery message for interval consumption sensor."""
+    return set_consumption_details(
+        payload={
+            "enabled_by_default": True,
+            "name": f"{device_name} Last Interval Consumption",
+            "unique_id": f"{device_id}_{LAST_INTERVAL_ATTR}",
+            "value_template": f"{{{{ value_json.{INTERVAL_FIELD}[0] }}}}",
+            "json_attributes_topic": f"{settings.MQTT_BASE_TOPIC}/{meter_id}",
+            "json_attributes_template": (
+                "{{ {"
+                f"'{INTERVAL_FIELD}': value_json.{INTERVAL_FIELD},"
+                f"'{INTERVAL_START_FIELD}': value_json.{INTERVAL_START_FIELD},"
+                f"'last_reset': value_json.{INTERVAL_START_FIELD}"
+                "} | tojson }}"
+            ),
+        },
+        meter=meter,
+    )
+
+
+def set_consumption_details(payload, meter):
+    """Set discovery details for a consumption sensor."""
+    payload["state_class"] = "total"
+    if "type" in meter:
+        if meter["type"] == "gas":
+            payload["device_class"] = "gas"
+        elif meter["type"] == "energy":
+            payload["device_class"] = "energy"
+        else:
+            payload["icon"] = "mdi:water"
+
+    if "unit_of_measurement" in meter:
+        payload["unit_of_measurement"] = meter["unit_of_measurement"]
+
+    return payload
+
+
+def create_sensor(attribute, device_name, device_id, enabled=True, category=None):
+    """Create generic discovery message to make reading attribute into sensor."""
+    # Turn camelcase into spaces
+    name = re.sub(r"([^A-Z]|ERT)([A-Z])", r"\1 \2", attribute)
+    sensor = {
+        "enabled_by_default": enabled,
+        "name": f"{device_name} {name}",
+        "state_class": "measurement",
+        "unique_id": f"{device_id}_{attribute}",
+        "value_template": f"{{{{ value_json.{attribute} }}}}",
+    }
+
+    if category:
+        sensor["entity_category"] = category
+
+    return sensor
+
+
+def publish_sensor_discovery(meter_id, device, attribute, payload):
+    """Publish discovery message to make reading attribute into sensor."""
+    base_payload = {
+        "availability": [
+            {
+                "topic": settings.MQTT_AVAILABILTY_TOPIC,
+            }
+        ],
+        "device": device,
+        "state_topic": f"{settings.MQTT_BASE_TOPIC}/{meter_id}",
+        "platform": "mqtt",
+    }
+
+    mqttc.publish(
+        topic=f"{settings.HA_DISCOVERY_TOPIC}/sensor/{meter_id}/{attribute}/config",
+        payload=json.dumps(payload | base_payload),
+        retain=True,
+    )
+
+
+def send_discovery_messages():
+    """Send discovery messages to create sensors for each watched meter."""
+    for meter_id, meter in settings.METERS.items():
+        device_id = f"amr2mqtt_{meter_id}"
+        device_name = meter.get("name", meter_id)
+        protocol = meter["protocol"]
+        device = {
+            "identifiers": [device_id],
+            "name": device_name,
+            "sw_version": settings.SW_VERSION,
+            "via_device": settings.VIA_DEVICE,
+        }
+
+        if "manufacturer" in meter:
+            device["manufacturer"] = meter["manufacturer"]
+
+        if "model" in meter:
+            device["model"] = meter["model"]
+
+        # All meters have a consumption sensor
+        consumption = set_consumption_details(
+            payload=create_sensor(
+                attribute=CONSUMPTION_FIELD,
+                device_name=device_name,
+                device_id=device_id,
+            ),
+            meter=meter,
+        )
+        publish_sensor_discovery(
+            meter_id=meter_id,
+            device=device,
+            attribute=CONSUMPTION_FIELD,
+            payload=consumption,
+        )
+
+        if settings.LAST_SEEN_ENABLED:
+            last_seen = create_sensor(
+                attribute=LAST_SEEN_ATTR,
+                device_name=device_name,
+                device_id=device_id,
+                enabled=False,
+                category=CATEGORY_DIAGNOSTIC,
+            )
+            last_seen["device_class"] = "timestamp"
+            last_seen["name"] = f"{device_name} Last Seen"
+            publish_sensor_discovery(
+                meter_id=meter_id,
+                device=device,
+                attribute=LAST_SEEN_ATTR,
+                payload=last_seen,
+            )
+
+        # IDM meters have interval consumption
+        if protocol in ["idm", "netidm"]:
+            publish_sensor_discovery(
+                meter_id=meter_id,
+                device=device,
+                attribute=LAST_INTERVAL_ATTR,
+                payload=create_interval_sensor(
+                    meter_id=meter_id,
+                    meter=meter,
+                    device_name=device_name,
+                    device_id=device_id,
+                ),
+            )
+
+        # Create disabled sensors from all other attributes so people can enable if they wish
+        for attr in ATTRIBUTES[protocol]:
+            publish_sensor_discovery(
+                meter_id=meter_id,
+                device=device,
+                attribute=attr,
+                payload=create_sensor(
+                    attribute=attr,
+                    device_name=device_name,
+                    device_id=device_id,
+                    enabled=False,
+                    category=CATEGORY_DIAGNOSTIC,
+                ),
+            )
+
+
+def adjust_reading(
+    reading_time,
+    meter_id,
+    reading,
+    consumption_field,
+    idm_interval=None,
+):
+    """Convert consumption and interval data using configured multiplier."""
+    meter = settings.METERS.get(meter_id, {})
+    multiplier = meter.get("multiplier", 1)
+    precision = meter.get("precision", -1)
+
+    if precision > -1:
+        convert = lambda value: round(value * multiplier, precision)
+    else:
+        convert = lambda value: value * multiplier
+
+    reading[CONSUMPTION_FIELD] = convert(reading[consumption_field])
+
+    if idm_interval is not None:
+        reading[INTERVAL_FIELD] = [
+            convert(interval) for interval in reading[INTERVAL_FIELD]
+        ]
+
+        if idm_interval.get(INTERVAL_ID_FIELD, -1) == reading[INTERVAL_ID_FIELD]:
+            reading[INTERVAL_START_FIELD] = idm_interval[INTERVAL_START_FIELD]
+        else:
+            interval_seconds = reading[IDM_TIME_OFFSET_FIELD] / 16
+            interval_start = reading_time - timedelta(seconds=interval_seconds)
+            reading[INTERVAL_START_FIELD] = interval_start.isoformat()
+            idm_interval[INTERVAL_ID_FIELD] = reading[INTERVAL_ID_FIELD]
+            idm_interval[INTERVAL_START_FIELD] = reading[INTERVAL_START_FIELD]
+
+
+def main_loop():
+    """Loop and process messages from rtlamr."""
+    idm_intervals = {}
+    mqttc.loop_start()
+    while True:
+        try:
+            amr_line = rtlamr.stdout.readline().strip()
+            amr_dict = json.loads(amr_line)
+
+            # Must have `message` or we ignore
+            if "Message" not in amr_dict:
+                continue
+
+            amr_message = amr_dict["Message"]
+            amr_time = parser.parse(amr_dict["Time"])
+            fields_count = len(amr_message.values())
+
+            # IDM results have 17 fields
+            if fields_count == 17:
+                msg_type = "idm"
+                meter_id = str(amr_message[IDM_ID_FIELD])
+                if meter_id not in idm_intervals:
+                    idm_intervals[meter_id] = {}
+                adjust_reading(
+                    reading_time=amr_time,
+                    meter_id=meter_id,
+                    reading=amr_message,
+                    consumption_field=IDM_CONSUMPTION_FIELD,
+                    idm_interval=idm_intervals[meter_id],
+                )
+
+            # NetIDM results have 16 fields
+            elif fields_count == 16:
+                msg_type = "netidm"
+                meter_id = str(amr_message[IDM_ID_FIELD])
+                if meter_id not in idm_intervals:
+                    idm_intervals[meter_id] = {}
+                adjust_reading(
+                    reading_time=amr_time,
+                    meter_id=meter_id,
+                    reading=amr_message,
+                    consumption_field=NETIDM_CONSUMPTION_FIELD,
+                    idm_interval=idm_intervals[meter_id],
+                )
+
+            # R900 results have 9 fields according to docs. But user reports
+            # suggest 8. Accept both since I don't have an R900 to test
+            elif fields_count in [8, 9]:
+                msg_type = "r900"
+                meter_id = str(amr_message[ID_FIELD])
+                adjust_reading(
+                    reading_time=amr_time,
+                    meter_id=meter_id,
+                    reading=amr_message,
+                    consumption_field=CONSUMPTION_FIELD,
+                )
+
+            # SCM results have 6 fields
+            elif fields_count == 6:
+                msg_type = "scm"
+                meter_id = str(amr_message[ID_FIELD])
+                adjust_reading(
+                    reading_time=amr_time,
+                    meter_id=meter_id,
+                    reading=amr_message,
+                    consumption_field=CONSUMPTION_FIELD,
+                )
+
+            # SCM+ results have 7 fields
+            elif fields_count == 7:
+                msg_type = "scm+"
+                meter_id = str(amr_message[SCMPLUS_ID_FIELD])
+                adjust_reading(
+                    reading_time=amr_time,
+                    meter_id=meter_id,
+                    reading=amr_message,
+                    consumption_field=CONSUMPTION_FIELD,
+                )
+
+            # invalid message or unsupported message type
+            else:
+                continue
+
+            # Add last seen if in use
+            if settings.LAST_SEEN_ENABLED:
+                if settings.LAST_SEEN_FORMAT == "ISO_8601_local":
+                    last_seen = (
+                        datetime.now().replace(microsecond=0).astimezone().isoformat()
+                    )
+                elif settings.LAST_SEEN_FORMAT == "ISO_8601":
+                    last_seen = (
+                        datetime.utcnow()
+                        .replace(microsecond=0, tzinfo=timezone.utc)
+                        .isoformat()
+                    )
+                else:
+                    last_seen = math.floor(time.time())
+
+                amr_message[LAST_SEEN_ATTR] = last_seen
+
+            # If in debugging mode, add the protocol to the message
+            if settings.WATCHED_PROTOCOLS == "all":
+                amr_message[PROTOCOL_ATTR] = msg_type
+
+            json_message = json.dumps(amr_message)
+            logging.debug(
+                "Meter: %s, MsgType: %s, Reading: %s",
+                meter_id,
+                msg_type,
+                json_message,
+            )
+
+            # Don't publish messages for watched meters that are the wrong protocol
+            # Seemed either some meters were dual protocool or two had duplicate IDs
+            if (
+                meter_id not in settings.METERS
+                or msg_type == settings.METERS[meter_id]["protocol"]
+            ):
+                mqttc.publish(
+                    topic=f"{settings.MQTT_BASE_TOPIC}/{meter_id}",
+                    payload=json_message,
+                )
+
+        except Exception as ex:  # pylint: disable=broad-except
+            logging.debug("Exception squashed! %s: %s", ex.__class__.__name__, ex)
+            time.sleep(2)
+
+
+# Register signals we listen for
+signal.signal(signal.SIGTERM, shutdown)
+signal.signal(signal.SIGINT, shutdown)
+
+rtlamr = start_rtlamr()
+mqttc = create_mqtt_client()
+
+if not settings.HA_DISCOVERY_DISABLED:
+    send_discovery_messages()
+
+main_loop()
