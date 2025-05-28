@@ -56,7 +56,7 @@ LAST_SEEN_ENABLED = LAST_SEEN_FORMAT != "disable"
 # RTLAMR options
 symbol_length = os.environ.get("SYMBOL_LENGTH")
 SYMBOL_LENGTH = int(symbol_length) if bool(symbol_length) else 72
-
+CENTERFREQ = 917M
 # Set up logging
 EV_TO_LOG_LEVEL = {
     "DEBUG": logging.DEBUG,
