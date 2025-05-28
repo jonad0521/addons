@@ -7,23 +7,22 @@ ENV RTLAMR_VERSION 0.9.1
 
 RUN set -eux; \
     apk update; \
-        apk add --no-cache --virtual .build-deps \
-            tar=1.34-r0 \
-            curl=7.83.1-r2 \
-        ; \
+    apk add --no-cache --virtual .build-deps tar curl; \
     APKARCH="$(apk --print-arch)"; \
+    echo "Architecture: $APKARCH"; \
     case "${APKARCH}" in \
-        x86_64)  BINARCH='amd64' ;; \
-        armhf)   BINARCH='arm' ;; \
-        armv7)   BINARCH='arm' ;; \
+        x86_64) BINARCH='amd64' ;; \
+        armhf) BINARCH='arm' ;; \
+        armv7) BINARCH='arm' ;; \
         aarch64) BINARCH='arm64' ;; \
         *) echo >&2 "error: unsupported architecture (${APKARCH})"; exit 1 ;; \
     esac; \
-    curl -J -L -o /tmp/rtlamr.tar.gz \
-    "https://github.com/bemasher/rtlamr/releases/download/v${RTLAMR_VERSION}/rtlamr_linux_${BINARCH}.tar.gz"; \
+    echo "Using BINARCH: $BINARCH"; \
+    echo "Using RTLAMR_VERSION: $RTLAMR_VERSION"; \
+    curl -v -J -L -o /tmp/rtlamr.tar.gz "https://github.com/bemasher/rtlamr/releases/download/v${RTLAMR_VERSION}/rtlamr_linux_${BINARCH}.tar.gz"; \
     tar -xf /tmp/rtlamr.tar.gz -C /usr/bin; \
     chmod a+x /usr/bin/rtlamr; \
-    rm /tmp/rtlamr.tar.gz;
+    rm /tmp/rtlamr.tar.gz
 
 # https://github.com/hassio-addons/addon-debian-base/releases
 # hadolint ignore=DL3006
